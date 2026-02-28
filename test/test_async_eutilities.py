@@ -72,20 +72,26 @@ class TestValidations(unittest.IsolatedAsyncioTestCase):
 class TestDelegation(unittest.IsolatedAsyncioTestCase):
     async def test_esearch_calls_request(self) -> None:
         with patch("async_eutilities._request", new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = "ok"
+            mock_request.return_value = (
+                '<?xml version="1.0"?><eSearchResult><IdList>'
+                "<Id>111</Id><Id>222</Id></IdList></eSearchResult>"
+            )
             result = await mod.esearch("asthma", db="pubmed")
 
-            self.assertEqual(result, "ok")
+            self.assertEqual(result, ["111", "222"])
             mock_request.assert_awaited_once()
             self.assertEqual(mock_request.await_args.args[0], "esearch.fcgi")
             self.assertEqual(mock_request.await_args.kwargs["params"], {"db": "pubmed", "term": "asthma"})
 
     async def test_esearch_hip_replacement_term(self) -> None:
         with patch("async_eutilities._request", new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = "ok"
+            mock_request.return_value = (
+                '<?xml version="1.0"?><eSearchResult><IdList>'
+                "<Id>333</Id></IdList></eSearchResult>"
+            )
             result = await mod.esearch("hip replacement")
 
-            self.assertEqual(result, "ok")
+            self.assertEqual(result, ["333"])
             self.assertEqual(mock_request.await_args.args[0], "esearch.fcgi")
             self.assertEqual(
                 mock_request.await_args.kwargs["params"],
@@ -94,11 +100,44 @@ class TestDelegation(unittest.IsolatedAsyncioTestCase):
 
     async def test_efetch_normalizes_ids(self) -> None:
         with patch("async_eutilities._request", new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = "ok"
-            await mod.efetch(ids=[1, "2", 3], db="pubmed")
+            mock_request.return_value = """<?xml version="1.0" encoding="UTF-8"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>123456</PMID>
+      <Article>
+        <ArticleTitle>Hip replacement outcomes</ArticleTitle>
+        <Abstract>
+          <AbstractText>Sample abstract text.</AbstractText>
+        </Abstract>
+        <Journal>
+          <JournalIssue>
+            <PubDate>
+              <Year>2024</Year>
+              <Month>Jun</Month>
+              <Day>10</Day>
+            </PubDate>
+          </JournalIssue>
+          <Title>Medical Journal</Title>
+        </Journal>
+        <AuthorList>
+          <Author>
+            <LastName>Doe</LastName>
+            <ForeName>Jane</ForeName>
+            <Initials>J</Initials>
+          </Author>
+        </AuthorList>
+      </Article>
+    </MedlineCitation>
+  </PubmedArticle>
+</PubmedArticleSet>
+"""
+            result = await mod.efetch(pmid="1", db="pubmed")
 
             self.assertEqual(mock_request.await_args.args[0], "efetch.fcgi")
-            self.assertEqual(mock_request.await_args.kwargs["params"], {"db": "pubmed", "id": "1,2,3"})
+            self.assertEqual(mock_request.await_args.kwargs["params"], {"db": "pubmed", "id": "1", "retmax": 1})
+            self.assertEqual(result.pmid, "123456")
+            self.assertEqual(result.article_title, "Hip replacement outcomes")
 
     async def test_esummary_accepts_history_options(self) -> None:
         with patch("async_eutilities._request", new_callable=AsyncMock) as mock_request:

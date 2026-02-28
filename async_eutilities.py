@@ -4,13 +4,14 @@ import asyncio
 import os
 from copy import deepcopy
 from typing import Any, Iterable
+from xml.etree import ElementTree as ET
 
 import httpx
 from dotenv import load_dotenv
+from pydantic import BaseModel, ConfigDict, Field
 
 BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
-# Load environment values from .env (if present) before reading NCBI settings.
 load_dotenv()
 
 
@@ -27,12 +28,34 @@ def _build_default_config() -> dict[str, Any]:
 
 
 _DEFAULT_CONFIG: dict[str, Any] = _build_default_config()
-
 _CONFIG: dict[str, Any] = deepcopy(_DEFAULT_CONFIG)
 
 
 class EUtilitiesError(Exception):
     """Raised when an E-utilities HTTP request fails after retries."""
+
+
+class EFetchAuthor(BaseModel):
+    """Normalized author fields parsed from PubMed XML."""
+
+    last_name: str | None = None
+    fore_name: str | None = None
+    initials: str | None = None
+    collective_name: str | None = None
+
+
+class EFetchRecord(BaseModel):
+    """One record parsed from an EFetch XML response."""
+
+    model_config = ConfigDict(extra="allow")
+
+    pmid: str | None = None
+    article_title: str | None = None
+    abstract: str | None = None
+    journal_title: str | None = None
+    publication_date: str | None = None
+    authors: list[EFetchAuthor] = Field(default_factory=list)
+    data: dict[str, Any] = Field(default_factory=dict)
 
 
 def configure(
@@ -45,20 +68,7 @@ def configure(
     max_retries: int = 2,
     retry_backoff: float = 0.5,
 ) -> None:
-    """Set global request defaults used by all E-utilities functions.
-
-    Use this once at startup to avoid repeating transport and auth options in every tool call.
-
-    Args:
-        api_key: NCBI API key for higher request limits. If omitted, `NCBI_API_KEY` from
-            `.env`/environment is used when available.
-        email: Contact email recommended by NCBI.
-        tool: Tool identifier sent to NCBI.
-        base_url: Base E-utilities URL.
-        timeout: Request timeout in seconds.
-        max_retries: Retry attempts on transient failures.
-        retry_backoff: Base backoff in seconds for exponential retry delays.
-    """
+    """Set global request defaults used by all E-utilities functions."""
     if timeout <= 0:
         raise ValueError("timeout must be greater than 0")
     if max_retries < 0:
@@ -100,9 +110,8 @@ def _normalize_ids(ids: Iterable[str | int] | str | int | None) -> str | None:
     if isinstance(ids, (str, int)):
         value = str(ids).strip()
         return value or None
-
-    items = [str(value).strip() for value in ids if str(value).strip()]
-    return ",".join(items) if items else None
+    values = [str(value).strip() for value in ids if str(value).strip()]
+    return ",".join(values) if values else None
 
 
 def _clean_params(params: dict[str, Any]) -> dict[str, str]:
@@ -120,11 +129,9 @@ def _clean_params(params: dict[str, Any]) -> dict[str, str]:
 def _merge_call_config(options: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
     opts = dict(options or {})
     config = deepcopy(_CONFIG)
-
     for config_key in ("api_key", "email", "tool", "base_url", "timeout", "max_retries", "retry_backoff"):
         if config_key in opts:
             config[config_key] = opts.pop(config_key)
-
     return config, opts
 
 
@@ -135,13 +142,7 @@ async def _request(
     method: str = "GET",
     options: dict[str, Any] | None = None,
 ) -> str:
-    """Execute a request against one E-utilities endpoint with retry logic.
-
-    Retry behavior:
-    - Retries transient HTTP errors (429 and 5xx)
-    - Retries network/timeout errors from `httpx`
-    - Uses exponential backoff based on configured `retry_backoff`
-    """
+    """Execute a request against one E-utilities endpoint with retry logic."""
     config, extra_params = _merge_call_config(options)
 
     if float(config["timeout"]) <= 0:
@@ -203,88 +204,151 @@ async def _request(
     raise EUtilitiesError(f"Request failed for {url}: {last_exc}") from last_exc
 
 
+def _strip_namespace(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def _xml_element_to_dict(element: ET.Element) -> Any:
+    children = list(element)
+    text = (element.text or "").strip()
+
+    if not children:
+        if element.attrib:
+            payload: dict[str, Any] = {"_attributes": dict(element.attrib)}
+            if text:
+                payload["_text"] = text
+            return payload
+        return text
+
+    payload: dict[str, Any] = {}
+    if element.attrib:
+        payload["_attributes"] = dict(element.attrib)
+    if text:
+        payload["_text"] = text
+
+    for child in children:
+        child_tag = _strip_namespace(child.tag)
+        child_value = _xml_element_to_dict(child)
+        if child_tag in payload:
+            existing = payload[child_tag]
+            if isinstance(existing, list):
+                existing.append(child_value)
+            else:
+                payload[child_tag] = [existing, child_value]
+        else:
+            payload[child_tag] = child_value
+
+    return payload
+
+
+def _find_text(element: ET.Element, xpath: str) -> str | None:
+    node = element.find(xpath)
+    if node is None:
+        return None
+    value = (node.text or "").strip()
+    return value or None
+
+
+def _extract_publication_date(article_elem: ET.Element) -> str | None:
+    pub_date = article_elem.find(".//Article/Journal/JournalIssue/PubDate")
+    if pub_date is None:
+        return None
+
+    year = _find_text(pub_date, "./Year")
+    month = _find_text(pub_date, "./Month")
+    day = _find_text(pub_date, "./Day")
+    medline_date = _find_text(pub_date, "./MedlineDate")
+
+    if year and month and day:
+        return f"{year}-{month}-{day}"
+    if year and month:
+        return f"{year}-{month}"
+    if year:
+        return year
+    return medline_date
+
+
+def _extract_authors(article_elem: ET.Element) -> list[EFetchAuthor]:
+    authors: list[EFetchAuthor] = []
+    for author_elem in article_elem.findall(".//Article/AuthorList/Author"):
+        authors.append(
+            EFetchAuthor(
+                last_name=_find_text(author_elem, "./LastName"),
+                fore_name=_find_text(author_elem, "./ForeName"),
+                initials=_find_text(author_elem, "./Initials"),
+                collective_name=_find_text(author_elem, "./CollectiveName"),
+            )
+        )
+    return authors
+
+
+def _build_pubmed_record(article_elem: ET.Element) -> EFetchRecord:
+    abstract_nodes = article_elem.findall(".//Article/Abstract/AbstractText")
+    abstract_parts = [" ".join(node.itertext()).strip() for node in abstract_nodes]
+    abstract = " ".join(part for part in abstract_parts if part).strip() or None
+
+    return EFetchRecord(
+        pmid=_find_text(article_elem, ".//MedlineCitation/PMID") or _find_text(article_elem, ".//PMID"),
+        article_title=" ".join(article_elem.findtext(".//Article/ArticleTitle", default="").split()) or None,
+        abstract=abstract,
+        journal_title=_find_text(article_elem, ".//Article/Journal/Title"),
+        publication_date=_extract_publication_date(article_elem),
+        authors=_extract_authors(article_elem),
+        data=_xml_element_to_dict(article_elem),
+    )
+
+
+def _parse_efetch_record(xml_text: str, db: str) -> EFetchRecord:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise EUtilitiesError(f"EFetch XML parsing failed: {exc}") from exc
+
+    if db.lower() == "pubmed":
+        first_article = root.find(".//PubmedArticle")
+        if first_article is None:
+            raise EUtilitiesError("No PubmedArticle found in EFetch response")
+        return _build_pubmed_record(first_article)
+
+    first_node = next(iter(list(root)), None)
+    if first_node is None:
+        raise EUtilitiesError("No records found in EFetch response")
+    return EFetchRecord(data={_strip_namespace(first_node.tag): _xml_element_to_dict(first_node)})
+
+
+def _parse_esearch_pmids(xml_text: str) -> list[str]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise EUtilitiesError(f"ESearch XML parsing failed: {exc}") from exc
+
+    return [node.text.strip() for node in root.findall(".//IdList/Id") if node.text and node.text.strip()]
+
+
 async def einfo(db: str = "pubmed", options: dict[str, Any] | None = None) -> str:
-    """Return metadata and search field information for an Entrez database.
-
-    Use this to inspect available fields and link names before building advanced queries.
-
-    Args:
-        db: Entrez database name. Defaults to `pubmed`.
-        options: Optional advanced params, e.g. `{"version": "2.0"}` plus transport overrides.
-
-    Returns:
-        Raw response text from `einfo.fcgi`.
-
-    Raises:
-        ValueError: If `db` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await einfo("pubmed")
-    """
+    """Return metadata and search field information for an Entrez database."""
     if not db or not db.strip():
         raise ValueError("db is required")
     return await _request("einfo.fcgi", params={"db": db.strip()}, options=options)
 
 
-async def esearch(term: str, db: str = "pubmed", options: dict[str, Any] | None = None) -> str:
-    """Search an Entrez database and return matching IDs.
-
-    Primary tool for literature search in PubMed. Advanced controls (pagination/history/sort)
-    are passed through `options`.
-
-    Args:
-        term: Entrez query string.
-        db: Entrez database. Defaults to `pubmed`.
-        options: Optional endpoint params such as `retmax`, `retstart`, `usehistory`,
-            `sort`, `field`, `datetype`, `mindate`, `maxdate`, `retmode`.
-
-    Returns:
-        Raw response text from `esearch.fcgi`.
-
-    Raises:
-        ValueError: If `term` or `db` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await esearch("asthma AND 2024[pdat]", options={"retmax": 20, "usehistory": True})
-    """
+async def esearch(term: str, db: str = "pubmed", options: dict[str, Any] | None = None) -> list[str]:
+    """Search an Entrez database and return only the list of PMIDs."""
     if not term or not term.strip():
         raise ValueError("term is required")
     if not db or not db.strip():
         raise ValueError("db is required")
 
-    return await _request(
+    xml_text = await _request(
         "esearch.fcgi",
         params={"db": db.strip(), "term": term.strip()},
         options=options,
     )
+    return _parse_esearch_pmids(xml_text)
 
 
-async def epost(
-    ids: str | int | Iterable[str | int],
-    db: str = "pubmed",
-    options: dict[str, Any] | None = None,
-) -> str:
-    """Upload IDs to Entrez History server for later chained requests.
-
-    Use this when you already have a large UID set and want to reference it via `WebEnv/query_key`.
-
-    Args:
-        ids: Single UID or iterable of UIDs to upload.
-        db: Entrez database. Defaults to `pubmed`.
-        options: Optional endpoint params such as `WebEnv` plus transport overrides.
-
-    Returns:
-        Raw response text from `epost.fcgi`.
-
-    Raises:
-        ValueError: If `ids` is empty or `db` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await epost([12345, 67890])
-    """
+async def epost(ids: str | int | Iterable[str | int], db: str = "pubmed", options: dict[str, Any] | None = None) -> str:
+    """Upload IDs to Entrez History server for later chained requests."""
     normalized_ids = _normalize_ids(ids)
     if not normalized_ids:
         raise ValueError("ids is required")
@@ -304,26 +368,7 @@ async def esummary(
     db: str = "pubmed",
     options: dict[str, Any] | None = None,
 ) -> str:
-    """Fetch document summaries (DocSums) for IDs or a history set.
-
-    Use after `esearch` or `epost` for lightweight metadata (titles, dates, journal, etc.).
-
-    Args:
-        ids: Optional single UID or iterable. If omitted, provide `query_key` and `WebEnv` in `options`.
-        db: Entrez database. Defaults to `pubmed`.
-        options: Optional endpoint params such as `query_key`, `WebEnv`, `retstart`,
-            `retmax`, `retmode`, `version` plus transport overrides.
-
-    Returns:
-        Raw response text from `esummary.fcgi`.
-
-    Raises:
-        ValueError: If neither `ids` nor history parameters are provided, or `db` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await esummary(options={"query_key": 1, "WebEnv": "...", "retmax": 10})
-    """
+    """Fetch document summaries (DocSums) for IDs or a history set."""
     if not db or not db.strip():
         raise ValueError("db is required")
 
@@ -340,45 +385,16 @@ async def esummary(
     return await _request("esummary.fcgi", params=params, options=opts)
 
 
-async def efetch(
-    ids: str | int | Iterable[str | int] | None = None,
-    db: str = "pubmed",
-    options: dict[str, Any] | None = None,
-) -> str:
-    """Fetch full records for IDs or a history set.
-
-    Use this for full PubMed/XML/MEDLINE content after selecting a set with `esearch` or `epost`.
-
-    Args:
-        ids: Optional single UID or iterable. If omitted, provide `query_key` and `WebEnv` in `options`.
-        db: Entrez database. Defaults to `pubmed`.
-        options: Optional endpoint params such as `query_key`, `WebEnv`, `rettype`,
-            `retmode`, `retstart`, `retmax`, `strand`, `seq_start`, `seq_stop`.
-
-    Returns:
-        Raw response text from `efetch.fcgi`.
-
-    Raises:
-        ValueError: If neither `ids` nor history parameters are provided, or `db` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await efetch(options={"query_key": 1, "WebEnv": "...", "rettype": "abstract"})
-    """
+async def efetch(pmid: str | int, db: str = "pubmed", options: dict[str, Any] | None = None) -> EFetchRecord:
+    """Fetch one full record by PMID and return a parsed Pydantic record."""
+    if str(pmid).strip() == "":
+        raise ValueError("pmid is required")
     if not db or not db.strip():
         raise ValueError("db is required")
 
-    normalized_ids = _normalize_ids(ids)
-    opts = dict(options or {})
-    has_history = bool(opts.get("query_key")) and bool(opts.get("WebEnv"))
-    if not normalized_ids and not has_history:
-        raise ValueError("provide ids or options with query_key and WebEnv")
-
-    params = {"db": db.strip()}
-    if normalized_ids:
-        params["id"] = normalized_ids
-
-    return await _request("efetch.fcgi", params=params, options=opts)
+    params = {"db": db.strip(), "id": str(pmid).strip(), "retmax": 1}
+    xml_text = await _request("efetch.fcgi", params=params, options=dict(options or {}))
+    return _parse_efetch_record(xml_text, db.strip())
 
 
 async def elink(
@@ -387,27 +403,7 @@ async def elink(
     db: str | None = None,
     options: dict[str, Any] | None = None,
 ) -> str:
-    """Find linked/related records across Entrez databases.
-
-    Use this to navigate from PubMed records to related records or linked resources.
-
-    Args:
-        ids: Optional single UID or iterable. If omitted, provide `query_key` and `WebEnv` in `options`.
-        dbfrom: Source database. Defaults to `pubmed`.
-        db: Destination database (optional depending on `cmd/linkname`).
-        options: Optional endpoint params such as `query_key`, `WebEnv`, `linkname`,
-            `cmd`, `term`, `holding` plus transport overrides.
-
-    Returns:
-        Raw response text from `elink.fcgi`.
-
-    Raises:
-        ValueError: If neither `ids` nor history parameters are provided, or `dbfrom` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await elink(ids=[12345], db="pmc", options={"cmd": "neighbor"})
-    """
+    """Find linked/related records across Entrez databases."""
     if not dbfrom or not dbfrom.strip():
         raise ValueError("dbfrom is required")
 
@@ -427,50 +423,14 @@ async def elink(
 
 
 async def egquery(term: str, options: dict[str, Any] | None = None) -> str:
-    """Run a global Entrez search and return counts per database.
-
-    Useful to estimate where a topic is concentrated before narrowing to PubMed.
-
-    Args:
-        term: Entrez query string.
-        options: Optional endpoint params plus transport overrides.
-
-    Returns:
-        Raw response text from `egquery.fcgi`.
-
-    Raises:
-        ValueError: If `term` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await egquery("diabetes mellitus")
-    """
+    """Run a global Entrez search and return counts per database."""
     if not term or not term.strip():
         raise ValueError("term is required")
-
     return await _request("egquery.fcgi", params={"term": term.strip()}, options=options)
 
 
 async def espell(term: str, db: str = "pubmed", options: dict[str, Any] | None = None) -> str:
-    """Return spelling suggestions for a search term.
-
-    Use this to detect likely misspellings before executing broad literature queries.
-
-    Args:
-        term: Query term to check.
-        db: Entrez database. Defaults to `pubmed`.
-        options: Optional endpoint params plus transport overrides.
-
-    Returns:
-        Raw response text from `espell.fcgi`.
-
-    Raises:
-        ValueError: If `term` or `db` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await espell("diabtes mellitus")
-    """
+    """Return spelling suggestions for a search term."""
     if not term or not term.strip():
         raise ValueError("term is required")
     if not db or not db.strip():
@@ -484,25 +444,7 @@ async def espell(term: str, db: str = "pubmed", options: dict[str, Any] | None =
 
 
 async def ecitmatch(bdata: str, db: str = "pubmed", options: dict[str, Any] | None = None) -> str:
-    """Resolve citation metadata to PMID matches.
-
-    Use this when you have citation fields (journal/year/volume/page/author) and need PMIDs.
-
-    Args:
-        bdata: Citation payload in the ECitMatch expected format.
-        db: Database name (ECitMatch is typically used with `pubmed`).
-        options: Optional endpoint params such as `rettype` plus transport overrides.
-
-    Returns:
-        Raw response text from `ecitmatch.cgi`.
-
-    Raises:
-        ValueError: If `bdata` or `db` is empty.
-        EUtilitiesError: If the request fails.
-
-    Example:
-        xml = await ecitmatch("proc natl acad sci u s a|1991|88|7|3248|mann bj|")
-    """
+    """Resolve citation metadata to PMID matches."""
     if not bdata or not bdata.strip():
         raise ValueError("bdata is required")
     if not db or not db.strip():
@@ -524,6 +466,8 @@ __all__ = [
     "configure",
     "get_config",
     "reset_config",
+    "EFetchAuthor",
+    "EFetchRecord",
     "einfo",
     "esearch",
     "epost",
