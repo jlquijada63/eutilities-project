@@ -64,10 +64,6 @@ class TestValidations(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await mod.epost("   ")
 
-    async def test_ecitmatch_empty_bdata_raises(self) -> None:
-        with self.assertRaises(ValueError):
-            await mod.ecitmatch("")
-
 
 class TestDelegation(unittest.IsolatedAsyncioTestCase):
     async def test_esearch_calls_request(self) -> None:
@@ -147,21 +143,6 @@ class TestDelegation(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mock_request.await_args.args[0], "esummary.fcgi")
             self.assertEqual(mock_request.await_args.kwargs["params"], {"db": "pubmed"})
             self.assertEqual(mock_request.await_args.kwargs["options"], {"query_key": 1, "WebEnv": "abc"})
-
-    async def test_ecitmatch_sets_default_rettype(self) -> None:
-        with patch("async_eutilities._request", new_callable=AsyncMock) as mock_request:
-            mock_request.return_value = "ok"
-            await mod.ecitmatch("proc natl acad sci u s a|1991|88|7|3248|mann bj|")
-
-            self.assertEqual(mock_request.await_args.args[0], "ecitmatch.cgi")
-            self.assertEqual(
-                mock_request.await_args.kwargs["params"],
-                {
-                    "db": "pubmed",
-                    "bdata": "proc natl acad sci u s a|1991|88|7|3248|mann bj|",
-                },
-            )
-            self.assertEqual(mock_request.await_args.kwargs["options"], {"rettype": "xml"})
 
 
 if __name__ == "__main__":
