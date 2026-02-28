@@ -1,98 +1,51 @@
-# Funciones E-utilities Extraídas del Manual
+# Funciones E-utilities (Estado Actual del Proyecto)
 
-Fuente: `eutilities_manual.pdf`
+Fuente de verdad: `async_eutilities.py`
 
-## Conjunto de funciones identificado
+## Funciones activas
 
-- `EInfo` (`einfo.fcgi`)
-- `ESearch` (`esearch.fcgi`)
-- `EPost` (`epost.fcgi`)
-- `ESummary` (`esummary.fcgi`)
-- `EFetch` (`efetch.fcgi`)
-- `ELink` (`elink.fcgi`)
-- `EGQuery` (`egquery.fcgi`)
-- `ESpell` (`espell.fcgi`)
-- `ECitMatch` (`ecitmatch.cgi`)
+- `einfo` -> `einfo.fcgi`
+- `esearch` -> `esearch.fcgi`
+- `epost` -> `epost.fcgi`
+- `esummary` -> `esummary.fcgi`
+- `efetch` -> `efetch.fcgi`
+- `elink` -> `elink.fcgi`
 
-## Detalle por función
+## Contrato actual de la API async
 
-### EInfo
+### `einfo(db="pubmed", options=None) -> str`
 
-- Endpoint: `einfo.fcgi`
-- Endpoint detectado en texto: `einfo.fcgi?db=<database>`
-- Propósito: Obtiene estadísticas de una base de datos Entrez (campos, enlaces, últimos updates).
-- Parámetros clave: `db`, `version`
-- Salida típica: lista de campos de búsqueda, enlaces disponibles y metadatos de la base
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/einfo.fcgi`
+- Propósito: metadata de base Entrez (campos, enlaces, estadísticas).
+- Parámetros frecuentes en `options`: `version`.
 
-### ESearch
+### `esearch(term, db="pubmed", options=None) -> list[str]`
 
-- Endpoint: `esearch.fcgi`
-- Endpoint detectado en texto: `esearch.fcgi?db=<database>&term=<query>`
-- Propósito: Busca en una base de datos Entrez y devuelve UIDs; puede guardar resultados en History server.
-- Parámetros clave: `db`, `term`, `retmax`, `retstart`, `sort`, `usehistory`
-- Salida típica: `Count`, `IdList`, y opcionalmente `WebEnv`/`QueryKey`
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi`
+- Propósito: buscar literatura y devolver PMIDs.
+- Retorno: lista de PMIDs (`list[str]`), no XML crudo.
+- Parámetros frecuentes en `options`: `retmax`, `retstart`, `sort`, `usehistory`, `datetype`, `mindate`, `maxdate`.
 
-### EPost
+### `epost(ids, db="pubmed", options=None) -> str`
 
-- Endpoint: `epost.fcgi`
-- Endpoint detectado en texto: `epost.fcgi?db=<database>&id=<uid_list>`
-- Propósito: Sube listas de UIDs al History server para usarlas en llamadas posteriores.
-- Parámetros clave: `db`, `id` (o `WebEnv` existente para anexar)
-- Salida típica: `WebEnv` y `QueryKey` para consultas encadenadas
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/epost.fcgi`
+- Propósito: subir IDs al History server.
+- Retorno: XML crudo del endpoint.
 
-### ESummary
+### `esummary(ids=None, db="pubmed", options=None) -> str`
 
-- Endpoint: `esummary.fcgi`
-- Endpoint detectado en texto: `esummary.fcgi?db=<database>&id=<uid_list>`
-- Propósito: Recupera resúmenes de documentos (DocSums) para uno o varios UIDs.
-- Parámetros clave: `db`, `id` o (`query_key` + `WebEnv`), `retmode`
-- Salida típica: `DocSum` por UID con campos resumidos
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi`
+- Propósito: recuperar DocSums por IDs o por history.
+- Requisito: `ids` o (`query_key` y `WebEnv`).
 
-### EFetch
+### `efetch(pmid, db="pubmed", options=None) -> EFetchRecord`
 
-- Endpoint: `efetch.fcgi`
-- Endpoint detectado en texto: `efetch.fcgi?db=<database>&id=<uid_list>&rettype=<retrieval_type>`
-- Propósito: Recupera registros completos en distintos formatos (por ejemplo XML, MEDLINE, FASTA).
-- Parámetros clave: `db`, `id` o (`query_key` + `WebEnv`), `rettype`, `retmode`, `retstart`, `retmax`
-- Salida típica: registros completos del recurso solicitado (p. ej., PubMed XML/MEDLINE)
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi`
+- Propósito: recuperar un solo registro por PMID y parsearlo.
+- Retorno: objeto Pydantic `EFetchRecord`.
+- Campos relevantes: `pmid`, `article_title`, `abstract`, `journal_title`, `publication_date`, `authors`, `data`.
 
-### ELink
+### `elink(ids=None, dbfrom="pubmed", db=None, options=None) -> str`
 
-- Endpoint: `elink.fcgi`
-- Endpoint detectado en texto: `elink.fcgi?dbfrom=<source_db>&db=<destination_db>&id=<uid_list>`
-- Propósito: Obtiene registros relacionados y enlaces entre bases de datos Entrez.
-- Parámetros clave: `dbfrom`, `db`, `id` o (`query_key` + `WebEnv`), `linkname`, `cmd`
-- Salida típica: conjuntos de UIDs relacionados y metadatos de enlace
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi`
+- Propósito: obtener enlaces/relaciones entre bases Entrez.
+- Requisito: `ids` o (`query_key` y `WebEnv`).
 
-### EGQuery
+## Notas de compatibilidad
 
-- Endpoint: `egquery.fcgi`
-- Endpoint detectado en texto: `egquery.fcgi?term=<query>`
-- Propósito: Ejecuta una búsqueda global en todas las bases Entrez y devuelve conteos por base.
-- Parámetros clave: `term`
-- Salida típica: conteo de resultados por base de datos Entrez
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/egquery.fcgi`
-
-### ESpell
-
-- Endpoint: `espell.fcgi`
-- Endpoint detectado en texto: `espell.fcgi?term=<query>&db=<database>`
-- Propósito: Obtiene sugerencias ortográficas para términos de búsqueda Entrez.
-- Parámetros clave: `term`, `db`
-- Salida típica: término original y término sugerido
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/espell.fcgi`
-
-### ECitMatch
-
-- Endpoint: `ecitmatch.cgi`
-- Endpoint detectado en texto: `ecitmatch.cgi?db=pubmed&rettype=xml&bdata=<citations>`
-- Propósito: Busca PMIDs a partir de datos de cita (journal, año, volumen, páginas, autor, etc.).
-- Parámetros clave: `db=pubmed`, `bdata`, `rettype`
-- Salida típica: mapeo de cita de entrada a PMID (cuando hay coincidencia)
-- URL base de ejemplo: `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/ecitmatch.cgi`
+- No están disponibles en el módulo actual: `egquery`, `espell`, `ecitmatch`.
+- Si se requieren, deben reintroducirse explícitamente en `async_eutilities.py`.
